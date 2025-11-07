@@ -1,239 +1,191 @@
+import math
 import torch
-import torch.nn as nn
+from torch import nn, Tensor
+from torch.nn import Transformer
 import torch.nn.functional as F
 
+PAD_IDX = 1
 
-# -----------------------------
-# Encoder với LayerNorm + Residual + Linear Projection FIXED
-# -----------------------------
-class EncoderLNRes(nn.Module):
-    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
-        super().__init__()
-        self.input_dim = input_dim
-        self.emb_dim = emb_dim
-        self.hid_dim = hid_dim
-        self.n_layers = n_layers
-
-        self.embedding = nn.Embedding(input_dim, emb_dim)
-        self.embedding2hidden = nn.Linear(emb_dim, hid_dim)  # projection
-        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout, batch_first=False)
+class PositionalEncoding(nn.Module):
+    def __init__(self, emb_size: int, dropout: float = 0.1, maxlen: int = 5000):
+        super(PositionalEncoding, self).__init__()
+        den = torch.exp(- torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(-2)
         self.dropout = nn.Dropout(dropout)
-        self.layernorm = nn.LayerNorm(hid_dim)
+        self.register_buffer('pos_embedding', pos_embedding)
 
-    def forward(self, src):
-        # src: [seq_len, batch_size]
-        embedded = self.dropout(self.embedding(src))  # [seq_len, batch, emb_dim]
+    def forward(self, token_embedding: Tensor):
+        return self.dropout(token_embedding + self.pos_embedding[:token_embedding.size(0), :])
 
-        # Project embedding to hidden dimension
-        embedded_proj = self.embedding2hidden(embedded)  # [seq_len, batch, hid_dim]
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, emb_size: int):
+        super(TokenEmbedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.emb_size = emb_size
 
-        # LSTM forward
-        outputs, (hidden, cell) = self.rnn(embedded)  # [seq_len, batch, hid_dim]
+    def forward(self, tokens: Tensor):
+        return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
 
-        # LayerNorm + Residual - FIXED: cộng outputs với embedded_proj
-        # outputs: LSTM outputs, embedded_proj: linear projection của input
-        outputs = self.layernorm(outputs + embedded_proj)  # [seq_len, batch, hid_dim]
+class Seq2SeqTransformer(nn.Module):
+    def __init__(self, num_encoder_layers, num_decoder_layers, emb_size, nhead, src_vocab_size, tgt_vocab_size, dim_feedforward=512, dropout=0.1):
+        super(Seq2SeqTransformer, self).__init__()
+        self.transformer = Transformer(d_model=emb_size, nhead=nhead, num_encoder_layers=num_encoder_layers,
+                                       num_decoder_layers=num_decoder_layers, dim_feedforward=dim_feedforward, dropout=dropout)
+        self.generator = nn.Linear(emb_size, tgt_vocab_size)
+        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
+        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
+        self.positional_encoding = PositionalEncoding(emb_size, dropout=dropout)
 
-        return hidden, cell, outputs
+    def forward(self, src, trg, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask, memory_key_padding_mask):
+        src_emb = self.positional_encoding(self.src_tok_emb(src))
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
+        outs = self.transformer(src_emb, tgt_emb, src_mask, tgt_mask, None,
+                                src_padding_mask, tgt_padding_mask, memory_key_padding_mask)
+        return self.generator(outs)
 
+    def encode(self, src, src_mask):
+        return self.transformer.encoder(self.positional_encoding(self.src_tok_emb(src)), src_mask)
 
-# -----------------------------
-# Decoder với LayerNorm + Residual + Linear Projection FIXED
-# -----------------------------
-class DecoderLNRes(nn.Module):
-    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
-        super().__init__()
-        self.output_dim = output_dim
-        self.emb_dim = emb_dim
-        self.hid_dim = hid_dim
-        self.n_layers = n_layers
+    def decode(self, tgt, memory, tgt_mask):
+        return self.transformer.decoder(self.positional_encoding(self.tgt_tok_emb(tgt)), memory, tgt_mask)
 
-        self.embedding = nn.Embedding(output_dim, emb_dim)
-        self.embedding2hidden = nn.Linear(emb_dim, hid_dim)  # projection
-        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout, batch_first=False)
-        self.fc_out = nn.Linear(hid_dim, output_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.layernorm = nn.LayerNorm(hid_dim)
+def generate_square_subsequent_mask(sz):
+    mask = (torch.triu(torch.ones((sz, sz))) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
 
-    def forward(self, input, hidden, cell):
-        # input: [batch_size]
-        # hidden: [n_layers, batch, hid_dim], cell: [n_layers, batch, hid_dim]
+def create_mask(src, tgt):
+    src_seq_len = src.shape[0]
+    tgt_seq_len = tgt.shape[0]
+    tgt_mask = generate_square_subsequent_mask(tgt_seq_len)
+    src_mask = torch.zeros((src_seq_len, src_seq_len), dtype=torch.bool)
+    src_padding_mask = (src == PAD_IDX).transpose(0, 1)
+    tgt_padding_mask = (tgt == PAD_IDX).transpose(0, 1)
+    return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
 
-        input = input.unsqueeze(0)  # [1, batch_size]
-        embedded = self.dropout(self.embedding(input))  # [1, batch, emb_dim]
-        embedded_proj = self.embedding2hidden(embedded)  # [1, batch, hid_dim]
+# Greedy decode for inference
+def greedy_decode(model, src, src_mask, max_len, start_symbol, EOS_IDX=3):
+    src = src
+    src_mask = src_mask
+    memory = model.encode(src, src_mask)
+    ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long)
+    for i in range(max_len-1):
+        tgt_mask = generate_square_subsequent_mask(ys.size(0)).type(torch.bool)
+        out = model.decode(ys, memory, tgt_mask)
+        out = out.transpose(0, 1)
+        prob = model.generator(out[:, -1])
+        _, next_word = torch.max(prob, dim=1)
+        next_word = next_word.item()
+        ys = torch.cat([ys, torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=0)
+        if next_word == EOS_IDX:
+            break
+    return ys
 
-        # LSTM forward - FIXED: sử dụng hidden và cell từ encoder
-        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))  # output: [1, batch, hid_dim]
+@torch.no_grad()
+def beam_search_decode(
+    model,
+    src,
+    src_mask,
+    max_len,
+    start_symbol,
+    EOS_IDX=3,
+    beam_size=5,
+    length_penalty=0.7,
+):
+    """
+    Beam search decode ổn định, tránh None output.
+    """
 
-        # LayerNorm + Residual
-        output = self.layernorm(output + embedded_proj)  # [1, batch, hid_dim]
+    device = src.device
+    memory = model.encode(src, src_mask)
 
-        # Prediction
-        prediction = self.fc_out(output.squeeze(0))  # [batch, output_dim]
+    # Beam khởi tạo
+    beam = [(torch.tensor([[start_symbol]], dtype=torch.long, device=device), 0.0)]
+    completed = []
 
-        return prediction, hidden, cell
+    for _ in range(max_len):
+        candidates = []
+        for seq, score in beam:
+            # Nếu kết thúc câu rồi thì giữ nguyên
+            if seq[-1].item() == EOS_IDX:
+                completed.append((seq, score))
+                continue
 
+            tgt_mask = generate_square_subsequent_mask(seq.size(0)).to(device)
+            out = model.decode(seq, memory, tgt_mask)
+            out = out.transpose(0, 1)
+            logits = model.generator(out[:, -1])
+            log_probs = F.log_softmax(logits, dim=-1)
 
-# -----------------------------
-# Seq2Seq FIXED
-# -----------------------------
-class Seq2SeqLNRes(nn.Module):
-    def __init__(self, encoder, decoder, device):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.device = device
+            # Lấy top beam_size token tiếp theo
+            topk_log_probs, topk_indices = torch.topk(log_probs, beam_size, dim=-1)
+            for k in range(beam_size):
+                next_token = topk_indices[0, k].item()
+                new_seq = torch.cat(
+                    [seq, torch.tensor([[next_token]], dtype=torch.long, device=device)],
+                    dim=0,
+                )
+                new_score = score + topk_log_probs[0, k].item()
+                candidates.append((new_seq, new_score))
 
-        # Kiểm tra compatibility
-        assert encoder.hid_dim == decoder.hid_dim, \
-            "Hidden dimensions of encoder and decoder must be equal!"
-        assert encoder.n_layers == decoder.n_layers, \
-            "Encoder and decoder must have the same number of layers!"
+        if not candidates:
+            break
 
-    def forward(self, src, tgt_input, teacher_forcing_ratio=0.5):
-        """
-        src: [src_seq_len, batch_size] - source sequence
-        tgt_input: [tgt_seq_len, batch_size] - target input (with <bos> but no <eos>)
-        teacher_forcing_ratio: probability to use teacher forcing
-        """
-        tgt_len = tgt_input.shape[0]
-        batch_size = src.shape[1]
-        tgt_vocab_size = self.decoder.output_dim
+        # Giữ lại top beam_size ứng viên tốt nhất
+        ordered = sorted(
+            candidates,
+            key=lambda t: t[1] / ((len(t[0]) ** length_penalty) + 1e-6),
+            reverse=True,
+        )
+        beam = ordered[:beam_size]
 
-        # Tensor to store decoder outputs
-        outputs = torch.zeros(tgt_len, batch_size, tgt_vocab_size).to(self.device)
+        # Dừng khi tất cả beam đều kết thúc
+        if all(seq[-1].item() == EOS_IDX for seq, _ in beam):
+            completed.extend(beam)
+            break
 
-        # Encode source sequence
-        hidden, cell, encoder_outputs = self.encoder(src)
+    # Nếu không có câu hoàn chỉnh → lấy beam hiện tại
+    if not completed:
+        completed = beam
 
-        # First input to decoder is <bos> token
-        # tgt_input[0] should be <bos> tokens for all batches
-        input = tgt_input[0, :]  # [batch_size]
+    # Chọn câu có score cao nhất
+    best_seq, best_score = sorted(
+        completed,
+        key=lambda t: t[1] / ((len(t[0]) ** length_penalty) + 1e-6),
+        reverse=True,
+    )[0]
 
-        for t in range(1, tgt_len):
-            # Decoder forward
-            output, hidden, cell = self.decoder(input, hidden, cell)
+    return best_seq
 
-            # Store prediction
-            outputs[t] = output
+def translate(model, src_sentence, text_transform, vocab_transform, BOS_IDX=2, EOS_IDX=3):
+    model.eval()
+    src = text_transform['en'](src_sentence).view(-1, 1)
+    num_tokens = src.shape[0]
+    src_mask = torch.zeros(num_tokens, num_tokens).type(torch.bool)
+    tgt_tokens = greedy_decode(model, src, src_mask, max_len=num_tokens+5, start_symbol=BOS_IDX, EOS_IDX=EOS_IDX).flatten()
+    return " ".join(vocab_transform['vi'].lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<bos>", "").replace("<eos>", "")
 
-            # Get top1 prediction
-            top1 = output.argmax(1)
+def translate_beam(model, src_sentence, text_transform, vocab_transform, BOS_IDX=2, EOS_IDX=3, beam_size=5):
+    model.eval()
+    device = next(model.parameters()).device
+    src = text_transform['en'](src_sentence).view(-1, 1).to(device)
+    num_tokens = src.shape[0]
+    src_mask = torch.zeros(num_tokens, num_tokens, dtype=torch.bool, device=device)
+    tgt_tokens = beam_search_decode(
+        model, src, src_mask,
+        max_len=num_tokens + 10,
+        start_symbol=BOS_IDX,
+        EOS_IDX=EOS_IDX,
+        beam_size=beam_size
+    ).flatten()
 
-            # Teacher forcing: use true next token, else use predicted token
-            if teacher_forcing_ratio > 0:
-                input = tgt_input[t] if torch.rand(1).item() < teacher_forcing_ratio else top1
-            else:
-                input = top1
-
-        return outputs  # [tgt_seq_len, batch_size, tgt_vocab_size]
-
-    def beam_search_decode(self, src, sos_idx=2, eos_idx=3, max_extra=10, beam_width=5, length_penalty=0.7):
-        """
-        Beam search decoding for SINGLE sequence
-        src: [seq_len, 1] tensor (batch_size=1)
-        """
-        self.eval()
-        with torch.no_grad():
-            seq_len = src.shape[0]
-            max_len = seq_len + max_extra
-
-            # Encode source - src should have batch_size=1
-            hidden, cell, _ = self.encoder(src)
-
-            # Initialize beam: [tokens, score, hidden, cell]
-            sequences = [[[sos_idx], 0.0, hidden, cell]]
-
-            for step in range(max_len):
-                all_candidates = []
-
-                for seq, score, hidden, cell in sequences:
-                    # If sequence already ended with <eos>, keep as is
-                    if seq[-1] == eos_idx:
-                        all_candidates.append([seq, score, hidden, cell])
-                        continue
-
-                    # Last token as input
-                    input_idx = seq[-1]
-                    input_tensor = torch.tensor([input_idx]).to(self.device)
-
-                    # Decoder forward
-                    output, hidden_new, cell_new = self.decoder(input_tensor, hidden, cell)
-                    log_probs = F.log_softmax(output, dim=1)  # [1, vocab_size]
-
-                    # Get top k candidates
-                    topk_log_probs, topk_idx = log_probs.topk(beam_width)
-
-                    for i in range(beam_width):
-                        token = topk_idx[0, i].item()
-                        log_prob = topk_log_probs[0, i].item()
-
-                        candidate_seq = seq + [token]
-                        new_score = score + log_prob
-
-                        # Apply length penalty
-                        lp = len(candidate_seq) ** length_penalty
-                        length_norm_score = new_score / lp if lp > 0 else new_score
-
-                        all_candidates.append([candidate_seq, length_norm_score, hidden_new, cell_new])
-
-                # Sort and select top beam_width sequences
-                ordered = sorted(all_candidates, key=lambda x: x[1], reverse=True)
-                sequences = ordered[:beam_width]
-
-                # Check if all top sequences ended
-                if all(seq[0][-1] == eos_idx for seq in sequences):
-                    break
-
-            # Return best sequence (without <sos> token)
-            best_sequence = sequences[0][0]
-            return best_sequence[1:]  # Remove <sos>
-
-    def translate_batch(self, src_batch, sos_idx=2, eos_idx=3, beam_width=3):
-        """
-        Translate a batch of sequences using greedy decoding (faster than beam search)
-        """
-        self.eval()
-        with torch.no_grad():
-            batch_size = src_batch.shape[1]
-            max_len = src_batch.shape[0] + 20  # Allow extra length
-
-            # Encode entire batch
-            hidden, cell, _ = self.encoder(src_batch)
-
-            # Start with <sos> for all sequences
-            current_input = torch.full((batch_size,), sos_idx, dtype=torch.long, device=self.device)
-            translations = [[] for _ in range(batch_size)]
-            completed = [False] * batch_size
-
-            for step in range(max_len):
-                if all(completed):
-                    break
-
-                output, hidden, cell = self.decoder(current_input, hidden, cell)
-                next_tokens = output.argmax(dim=1)  # Greedy decoding
-
-                for i in range(batch_size):
-                    if not completed[i]:
-                        token = next_tokens[i].item()
-                        translations[i].append(token)
-                        if token == eos_idx:
-                            completed[i] = True
-
-                # Prepare next input
-                current_input = next_tokens
-
-            return translations
-
-
-# -----------------------------
-# Model Initialization Helper
-# -----------------------------
-def initialize_model(input_dim, output_dim, emb_dim, hid_dim, n_layers, dropout, device):
-    """Helper function to initialize encoder, decoder and seq2seq model"""
-    encoder = EncoderLNRes(input_dim, emb_dim, hid_dim, n_layers, dropout)
-    decoder = DecoderLNRes(output_dim, emb_dim, hid_dim, n_layers, dropout)
-    model = Seq2SeqLNRes(encoder, decoder, device)
-
-    return model.to(device)
+    tokens = vocab_transform['vi'].lookup_tokens(list(tgt_tokens.cpu().numpy()))
+    print("🔍 Tokens:", tokens)  # debug
+    translated = " ".join(tokens).replace("<bos>", "").replace("<eos>", "").strip()
+    if not translated:
+        return "(⚠️ Beam output empty — model may output only <eos>)"
+    return translated
